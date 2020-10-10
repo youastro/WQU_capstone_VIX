@@ -27,33 +27,38 @@ class VIXTermStructure(QCAlgorithm):
         self.SetEndDate(2017, 12, 31)     # Set End Date
         self.SetCash(100000000)          # Set Strategy Cash
         
+        # if the weight of a futures contract is lower than this, we will not trade
         self.thresholdToPlaceOrder = 0.001
         self.multipler = 1000 # VIX multipler is $1000
-        self.fee = 0.05 
-        self.vixvolColPrefix = "ivcall" #ivmean doesn't always exist, e.g. 2014/02/14
         
+        # transaction fee
+        self.fee = 0.05 
+        
+        # we use the implied vol from the call options as the mean vol doesn't always exist, e.g. 2014/02/14
+        self.vixvolColPrefix = "ivcall" 
+        
+        # we don't trade on weekends and holidays
         holidays = self.TradingCalendar.GetDaysByType(TradingDayType.PublicHoliday, self.StartDate, self.EndDate)
         self.holidays = [i.Date.date() for i in holidays]
         
         self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin)
 
-        # self.vix = self.AddData(QuandlVix, "CBOE/VIX", Resolution.Daily).Symbol              # Add Quandl VIX price (daily), no longer works
-
+        # the token is purchased from Quandl with a monthly cost, will need to be updated if it expires.
         Quandl.SetAuthCode("WFW5X2RC9YiGoVUbbsX_")
         self.vxxvol = self.AddData(QuandlVxx, "VOL/VXX", Resolution.Daily, TimeZones.NewYork).Symbol
         self.vixvol = self.AddData(QuandlVxx, "VOL/VIX", Resolution.Daily, TimeZones.NewYork).Symbol
 
+        # vix data
         self.Download("http://cache.quantconnect.com/alternative/cboe/vix.csv")
         self.vix = self.AddData(CBOE,"VIX").Symbol
 
+        # VX9 misses 01/23 - 03/23 in 2015, exclude vx9 from modeling
         # need 8 monthly futures because when calculating the weights I will exclude the current front month
-        # and the second month seems to have problem when computing PNL at the expiry date
         self.nfut = 8
         self.nexclude = 1
         self.VIX_futures_names = ["VX" + str(i) for i in range(1, 1 + self.nfut)]
         self.VIX_symbols =[]
         for vname in self.VIX_futures_names:
-            # VX9 misses 01/23 - 03/23 in 2015, exclude vx9 from modeling
             self.VIX_symbols.append( self.AddData(QuandlFutures, "CHRIS/CBOE_" + vname, Resolution.Daily).Symbol )
           
         # the data of VXX or vxx.1 don't match with online sources (e.g. yahoo) after 2018
@@ -62,29 +67,21 @@ class VIXTermStructure(QCAlgorithm):
         self.vxx = self.AddEquity("vxx.1",  Resolution.Daily).Symbol                           # Add VXX, vxx.1 is the permtick according to the link
         # use this ticker after 2018
         #self.vxx = self.AddEquity("VXX",  Resolution.Daily).Symbol           
-        
-        #self.Securities[self.vxx].SetDataNormalizationMode(DataNormalizationMode.Raw);
-        
-        # 2009-01-30 to 2020-08-10
-        #self.vxx = self.AddData(VXXData, "VXX", Resolution.Daily).Symbol
-
-        # Add VIX futures contract data 
-        # this is strange, if I set the time resolution to daily, i don't get any future contracts from data.FutureChains
-        # even with minute resolution, i don't get future contracts the first time I call data.FutureChains
+                
         vixfuture = self.AddFuture(Futures.Indices.VIX)
         vixfuture.SetFilter(timedelta(0), timedelta(300))
 
-        # 2011 to present
+        # the expiration dates of VIX futures from 2011 to present
         expiry_f = self.Download("https://www.dropbox.com/s/ny8nxqcp6u76igw/expiry.csv?dl=1")
         self.expiry = pd.read_csv(StringIO(expiry_f), names=["expiry"], parse_dates=["expiry"], infer_datetime_format=True)["expiry"].tolist()
 
-        #stores the map from expiry to the contract
+        # this is used to store the map from expiration date to real VXI futures that can be used for trading
         self.contracts = {}
         
         # index of the front contract
         self.nextRebalanceIndex = bisect.bisect_left(self.expiry, self.StartDate)
-
-        # weight for vix future contracts and vxx (the last one), initialize to 0
+        
+        # weight for vix future contracts and vxx (the last one), assign initial positions
         self.curWeight = np.array([0.] * (self.nfut - self.nexclude + 1))
         self.curWeight[0] = -0.1
         self.curWeight[-1] = 0.1
@@ -123,18 +120,19 @@ class VIXTermStructure(QCAlgorithm):
                     self.MarketOrder(self.contracts[expiry].Symbol, -holding)
                 else:
                     self.MarketOrder(self.contracts[expiry].Symbol, holding)
-            self.curWeight = self.curWeight[1:] # remove the first element
+            self.curWeight = self.curWeight[1:] # remove the first weight as it has been liquidated
             self.curWeight = np.append(self.curWeight, 0) # append another one at the end
             self.nextRebalanceIndex += 1
             return
 
-        # now if it is not an expiry date
+        # now if it is not an expiry date, we calculate the new weights
         weights = self.CalCoeff()
         if weights is None:
             self.Log("failed to calculate weight for " + str(self.Time.date()))
             return
         self.Log(" new weights: " + str(weights) + ", current weights : " + str(self.curWeight))
 
+        # now let's trade
         self.PrintPort("before trading")
         totalMargin = self.Portfolio.TotalPortfolioValue
         for i in range(self.nfut - self.nexclude):
@@ -145,49 +143,55 @@ class VIXTermStructure(QCAlgorithm):
                 continue
             
             if (np.abs(weights[i] - self.curWeight[i]) > self.thresholdToPlaceOrder):
+                # only trade the difference
                 qty = int(totalMargin * (weights[i] - self.curWeight[i]) / \
                     self.Securities[self.contracts[expiry].Symbol].Price / self.multipler)
+                # send a market order of VIX futures contract
                 orderticket = self.MarketOrder(self.contracts[expiry].Symbol, qty)
-                self.Log("traded " + str(self.contracts[expiry].Symbol) + " " + str(qty) + " " \
-                    + str(expiry) + " " + str(orderticket.QuantityFilled) + "@" + str(orderticket.AverageFillPrice))
-                self.PrintOrderStatus(orderticket)
             else:
                 # if not traded because of too small of difference, we need to update in the new weights
                 weights[i] = self.curWeight[i]
 
         qty = int(totalMargin * (weights[-1] - self.curWeight[-1]) / self.Securities[self.vxx].Price)
+        # send a markt order of VXX
         orderticket = self.MarketOrder(self.vxx, qty)
-        self.Log("traded VXX" + str(orderticket.QuantityFilled) + "@" + str(orderticket.AverageFillPrice) + \
-                " status: " + str(orderticket.Status) + " requested qty: " + str(qty) )
-        self.PrintOrderStatus(orderticket)
 
         self.curWeight = weights
         self.PrintPort("after trading")
         
+    # this function calculates the new weights of the portfolio
     def CalCoeff(self):
         
+        # the platform contains bad data points, which will currupt the calculation
+        # we skip the days with bad data points.
         try:
+            # correlation matrix between vix futures and vxx
             corr_M = self.CalCorrelationM()
             self.Log("corr:")
             self.Log(corr_M)
             
+            # expected return from vix futures
             exret = self.ExRet()
             self.Log("ExRet")
             self.Log(exret)
             
+            # vix vols
             vixvol_df = self.VIXVol()
             self.Log("vixvol_df")
             self.Log(vixvol_df)
 
             # contractIndex =1 is the front month
+            # calculate the days to expiration of each VIX futures contract
             days2exp = []
             for contractIndex in range(self.nexclude+1, self.nfut+1):
                 days2exp.append( self.DaysToExpire(self.Time.date(), contractIndex) )
             
+            # use interpolation to find out vix vols at each futures expiration
             vixVols = self.VIXVol_interp(vixvol_df, days2exp)
             self.Log("vixvol")
             self.Log(vixVols)
-    
+
+            # retrieve VXX vols
             vxxvol = self.VXXVol()
 
             vols = vixVols.copy()
@@ -209,6 +213,7 @@ class VIXTermStructure(QCAlgorithm):
 
             return  firstTerm + secondTerm + thirdterm
 
+        # set the constraint that the total abs weight is less than 1
         def contrain(weights):
             return 1 - sum(map(abs,weights[:-1]))
 
@@ -218,14 +223,13 @@ class VIXTermStructure(QCAlgorithm):
 
         return res.x
 
-
+    # calculate the correlation matrix between vix futures and vxx
     def CalCorrelationM(self):
         
         window = 35
         
         # excluding the front month and second month
         vxhist = self.History(self.VIX_symbols[self.nexclude:], timedelta(days=window), Resolution.Daily)
-        # should we use settlement price or close price here?
         vxhist = vxhist['settle'].unstack(level=0)
         vxhist.columns = self.VIX_futures_names[self.nexclude:]
 
@@ -248,6 +252,7 @@ class VIXTermStructure(QCAlgorithm):
 
         return returndf.corr(method="pearson")
 
+    # get historical VXX vols
     def VXXVol(self):
         vxxvolhist = self.History([self.vxxvol], 5, Resolution.Daily)
         vxxvolhist.index = vxxvolhist.index.droplevel()
@@ -260,6 +265,7 @@ class VIXTermStructure(QCAlgorithm):
         # divide by 100 is arbitrary, just a test to keep the first term on the same order of other terms
         return vxxvolhist[self.vixvolColPrefix + "30"].tolist()[0] / 10.
 
+    # get historical VIX vols
     def VIXVol(self):
         vixvolhist = self.History([self.vixvol], 5, Resolution.Daily)
         
@@ -280,7 +286,8 @@ class VIXTermStructure(QCAlgorithm):
         vixvolhist.columns = ["VIXVol"]
         # divide by 100 is arbitrary, just a test to keep the first term on the same order of other terms
         return vixvolhist/10.
-        
+       
+    # run interpolation on VIX vols
     def VIXVol_interp(self, vixvol_df, numOfDaysArr):
         for numOfDays in numOfDaysArr:
             vixvol_df.loc[numOfDays] = np.nan
@@ -288,6 +295,8 @@ class VIXTermStructure(QCAlgorithm):
         vixvol_df = vixvol_df.interpolate(method='polynomial', order=2)
         return (vixvol_df.loc[numOfDaysArr])[vixvol_df.columns[0]].tolist()
 
+    
+    # expected return from futures contract
     def ExRet(self):
         
         #get the close price from yesterday
@@ -321,13 +330,14 @@ class VIXTermStructure(QCAlgorithm):
         return fdf.loc[self.Time.date()]
 
     # contractIndex=1 is the front month
+    # computes the number of days to expiration
     def DaysToExpire(self, today, contractIndex):
         index = bisect.bisect_left(self.expiry, today)
         return (self.expiry[index + contractIndex].date() - today).days
 
+    # computes the transaction cost
     def CalCost(self, weight):
         vxhist = self.History(self.VIX_symbols[self.nexclude:], timedelta(days=6), Resolution.Daily)
-        # should we use settlement price or close price here?
         vxhist = vxhist['settle'].unstack(level=0)
         vxhist.columns = self.VIX_futures_names[self.nexclude:]
         vxhist = vxhist.shift(1)  # to avoid the look-ahead bias
@@ -341,8 +351,6 @@ class VIXTermStructure(QCAlgorithm):
         pct_change = vxhist_pct_change.loc[self.Time.date()] + 1
 
         weight_with_return = pd.Series(self.curWeight).reset_index(drop=True) * pct_change.reset_index(drop=True)
-        # if self.Time.date() in self.expiry:
-        #     weight_with_return = weight_with_return.shift(-1, fill_value = 0)
     
         costRatio = (self.fee / vxhist.loc[self.Time.date()]).reset_index(drop=True) * \
             ((pd.Series(weight) - weight_with_return).abs()).reset_index(drop=True)
