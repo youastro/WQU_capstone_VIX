@@ -29,14 +29,13 @@ class SimpleVIX(QCAlgorithm):
         self.SetEndDate(2018, 12, 31)     # Set End Date
         self.SetCash(10000000)          # Set Strategy Cash
         
+        # if the weight of a futures contract is lower than this, we will not trade
         self.thresholdToPlaceOrder = 0.000001
-        self.multipler = 1000 # VIX multipler is $1000
+        self.multipler = 1000 # VIX futures multipler is $1000
         
         self.SetBrokerageModel(BrokerageName.InteractiveBrokersBrokerage, AccountType.Margin)
 
-        # self.vix = self.AddData(QuandlVix, "CBOE/VIX", Resolution.Daily).Symbol              # Add Quandl VIX price (daily)
-        # self.es1 = self.AddData(QuandlFutures, "CHRIS/CME_ES1", Resolution.Daily).Symbol     # Add Quandl E-mini S&P500 front month futures data (daily)
-
+        # VX9 misses 01/23 - 03/23 in 2015, exclude vx9 from modeling
         # need 8 monthly futures because when calculating the weights I will exclude the current front month
         # and the second month seems to have problem when computing PNL at the expiry date
         self.nfut = 8
@@ -44,30 +43,23 @@ class SimpleVIX(QCAlgorithm):
         self.VIX_futures_names = ["VX" + str(i) for i in range(1, 1 + self.nfut)]
         self.VIX_symbols =[]
         for vname in self.VIX_futures_names:
-            # VX9 misses 01/23 - 03/23 in 2015, exclude vx9 from modeling
             self.VIX_symbols.append( self.AddData(QuandlFutures, "CHRIS/CBOE_" + vname, Resolution.Daily).Symbol )
           
         # the data of VXX or vxx.1 don't match with online sources (e.g. yahoo) after 2018
         # https://www.quantconnect.com/forum/discussion/7975/can-039-t-load-historical-vxx-data-even-though-it-looks-like-it-exists/p1
-        
         # use this ticker before 2019
         self.vxx = self.AddEquity("vxx.1",  Resolution.Daily).Symbol                           # Add VXX, vxx.1 is the permtick according to the link
         # use this ticker after 2018
         #self.vxx = self.AddEquity("VXX",  Resolution.Daily).Symbol           
         
-        # 2009-01-30 to 2020-08-10
-        #self.vxx = self.AddData(VXXData, "VXX", Resolution.Daily).Symbol
-
-        # Add VIX futures contract data 
-        # this is strange, if I set the time resolution to daily, i don't get any future contracts from data.FutureChains
-        # even with minute resolution, i don't get future contracts the first time I call data.FutureChains
         vixfuture = self.AddFuture(Futures.Indices.VIX)
         vixfuture.SetFilter(timedelta(0), timedelta(300))
 
-        # 2011 to present
+        # the expiration dates of VIX futures from 2011 to present
         expiry_f = self.Download("https://www.dropbox.com/s/ny8nxqcp6u76igw/expiry.csv?dl=1")
         self.expiry = pd.read_csv(StringIO(expiry_f), names=["expiry"], parse_dates=["expiry"], infer_datetime_format=True)["expiry"].tolist()
 
+        # this is used to store the map from expiration date to real VXI futures that can be used for trading
         self.contracts = {}
         
         index = bisect.bisect_left(self.expiry, self.StartDate)
@@ -75,10 +67,7 @@ class SimpleVIX(QCAlgorithm):
         self.nextRebalanceDT = self.expiry[index] + timedelta(hours=18)
         self.nextRebalanceIndex = index
 
-        self.count = 1
-
         # we trade at 10am ET next day the front month expires.
-        # if we don't liquidate the front month before it expires, quantconnect seems to have some problem to compute the correct PNL
         self.Schedule.On(self.DateRules.EveryDay(), self.TimeRules.At(10,0), self.tryTrade)
 
     def OnData(self, data):
@@ -96,16 +85,16 @@ class SimpleVIX(QCAlgorithm):
                 self.contracts[contract.Expiry.date()] = contract
                 self.Log(str(contract.Symbol) + " expiry=" +  str(contract.Expiry.date()))
 
-        # self.count += 1
-        # if self.count > 100:
-        #     self.Quit()
-                
+        # only trade right after the next rebalance date
         if self.Time < self.nextRebalanceDT:
             return
         
+        # calculate the weights of each VIX futures contract
         coeffs = self.cal_coeff()
 
         self.print_port("before liquidation")
+        
+        # this could be optimized: instead of liquidating all the positions, we could just trade the difference
         self.Liquidate()
         self.print_port("before trading")
         totalMargin = self.Portfolio.MarginRemaining / 2.0
@@ -118,18 +107,13 @@ class SimpleVIX(QCAlgorithm):
             
             if (np.abs(coeffs[i-self.nexclude]) > self.thresholdToPlaceOrder):
                 qty = int(totalMargin * coeffs[i-self.nexclude] / self.Securities[self.contracts[nextExpiry].Symbol].Price / self.multipler)
+                # send a market order of VIX futures contract
                 orderticket = self.MarketOrder(self.contracts[nextExpiry].Symbol, qty)
-                # self.Log("traded " + str(self.contracts[nextExpiry].Symbol) + " " + str(coeffs[i-1]) + " " \
-                #     + str(nextExpiry) + " " + str(orderticket.QuantityFilled) + "@" + str(orderticket.AverageFillPrice))
-                #self.print_order_status(orderticket)
 
         qty = int(totalMargin / self.Securities[self.vxx].Price )
+        # send a markt order of VXX 
         orderticket = self.MarketOrder(self.vxx, -qty)
-        # self.Log("traded VXX" + str(orderticket.QuantityFilled) + "@" + str(orderticket.AverageFillPrice) + \
-        #         " status: " + str(orderticket.Status) + " requested qty: " + str(qty) )
                 
-        #self.print_order_status(orderticket)
-
         self.print_port("after trading")
         
         self.nextRebalanceIndex += 1
@@ -142,7 +126,6 @@ class SimpleVIX(QCAlgorithm):
         
         # excluding the front month and second month
         vxhist = self.History(self.VIX_symbols[self.nexclude:], timedelta(days=window), Resolution.Daily)
-        # should we use settlement price or close price here?
         vxhist = vxhist['settle'].unstack(level=0)
         vxhist.columns = self.VIX_futures_names[self.nexclude:]
 
@@ -173,12 +156,18 @@ class SimpleVIX(QCAlgorithm):
         def contrain(weights):
             return sum(weights) - 1
 
+        # setup the contraints
         cons = [{"type" : "eq", "fun" : contrain}]
+        
+        #setup the boundaries
         bnd = (0, np.inf)
         bounds = tuple([bnd] * (self.nfut - self.nexclude))
+        
+        # setup the init guess
         w0 = [1/(self.nfut - self.nexclude)] * (self.nfut -self.nexclude)
+        
+        # now run the optimization
         res = minimize(objective, w0, method="SLSQP", bounds=bounds, constraints = cons, options={"disp" : True})
-        #res = minimize(objective, w0, method="SLSQP")
 
         return res.x
 
